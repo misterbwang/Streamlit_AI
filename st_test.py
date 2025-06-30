@@ -3,79 +3,90 @@ import pandas as pd
 import sqlalchemy
 import requests
 
+from langchain_community.chat_models import ChatOllama
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.document_loaders import TextLoader, PyPDFLoader
+from langchain.chains import RetrievalQA
+from langchain.schema import HumanMessage, AIMessage, SystemMessage
+from langsmith import traceable
+from tempfile import NamedTemporaryFile
 
-st.sidebar.title("Data Input")
 
-# Select input method
-input_method = st.sidebar.radio(
-    "Choose your data source:",
-    ("Upload Files", "Connect to Database")
-)
+st.set_page_config(page_title="🧠 RAG Chat with Ollama", layout="wide")
+st.title("📁 Upload Files and Chat with RAG + Ollama")
+
+st.sidebar.title("📤 Upload Data")
+input_method = st.sidebar.radio("Choose input method:", ["Upload Files", "Connect to Database"])
+
+temp_llm = "cognitivecomputations/dolphin-llama3.1"
 
 dataframes = []
+documents_to_index = []
 
 if input_method == "Upload Files":
     uploaded_files = st.sidebar.file_uploader(
-        "Upload one or more files",
+        "Upload .csv, .xlsx, .txt, or .pdf",
         accept_multiple_files=True,
-        type=["csv", "xlsx"]
+        type=["csv", "xlsx", "txt", "pdf"]
     )
 
     if uploaded_files:
         for file in uploaded_files:
-            if file.name.endswith(".csv"):
+            filename = file.name
+            if filename.endswith(".csv"):
                 df = pd.read_csv(file)
-            elif file.name.endswith(".xlsx"):
+                dataframes.append((filename, df))
+            elif filename.endswith(".xlsx"):
                 df = pd.read_excel(file)
+                dataframes.append((filename, df))
+            elif filename.endswith(".txt"):
+                with NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
+                    tmp.write(file.read())
+                    tmp_path = tmp.name
+                loader = TextLoader(tmp_path)
+                documents_to_index.extend(loader.load())
+            elif filename.endswith(".pdf"):
+                with NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(file.read())
+                    tmp_path = tmp.name
+                loader = PyPDFLoader(tmp_path)
+                documents_to_index.extend(loader.load())
             else:
-                st.warning(f"Unsupported file format: {file.name}")
-                continue
+                st.warning(f"Unsupported file format: {filename}")
 
-            dataframes.append((file.name, df))
+    for name, df in dataframes:
+        st.subheader(f"Preview: {name}")
+        st.dataframe(df.head())
 
-        for name, df in dataframes:
-            st.subheader(f"Preview: {name}")
-            st.dataframe(df.head())
+# --- Initialize embeddings and RAG components once ---
+@st.cache_resource
+def initialize_rag(docs, value = temp_llm):
+    if not docs:
+        # fallback dummy document
+        from langchain.schema.document import Document
+        docs = [Document(page_content="This is a placeholder. Please upload text or PDF files.")]
+    
+    splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    chunks = splitter.split_documents(docs)
 
-elif input_method == "Connect to Database":
-    st.sidebar.subheader("Database Credentials")
+    embeddings = OllamaEmbeddings(model="EntropyYue/jina-embeddings-v2-base-zh:latest")
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    retriever = vectorstore.as_retriever()
 
-    db_type = st.sidebar.selectbox("Database Type", ["PostgreSQL", "MySQL", "SQLite"])
-    host = st.sidebar.text_input("Host", "localhost")
-    port = st.sidebar.text_input("Port", "5432" if db_type == "PostgreSQL" else "3306")
-    database = st.sidebar.text_input("Database Name")
-    user = st.sidebar.text_input("User")
-    password = st.sidebar.text_input("Password", type="password")
+    llm = ChatOllama(model= value)
+    qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
+    return qa_chain
 
-    connect_button = st.sidebar.button("Connect")
-
-    if connect_button:
-        try:
-            if db_type == "PostgreSQL":
-                uri = f"postgresql://{user}:{password}@{host}:{port}/{database}"
-            elif db_type == "MySQL":
-                uri = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
-            elif db_type == "SQLite":
-                uri = f"sqlite:///{database}"  # For SQLite, `database` is the path to the file
-
-            engine = sqlalchemy.create_engine(uri)
-            tables = engine.table_names()
-            selected_table = st.sidebar.selectbox("Select a Table", tables)
-
-            if selected_table:
-                df = pd.read_sql_table(selected_table, con=engine)
-                st.subheader(f"Preview: {selected_table}")
-                st.dataframe(df.head())
-        except Exception as e:
-            st.error(f"Failed to connect or load data: {e}")
-
+rag_chain = initialize_rag(documents_to_index)
 
 st.title("🧠 Chat with LLMs via Ollama")
 
 # --- Sidebar: Model and Prompt Configuration ---
 st.sidebar.title("🔧 Model & Prompt Settings")
 
-ollama_model = st.sidebar.text_input("Ollama model name", value="cognitivecomputations/dolphin-llama3.1")
+ollama_model = st.sidebar.text_input("Ollama model name", value = temp_llm)
 
 prompt_options = {
     "Helpful Assistant": "You are a helpful and friendly AI assistant.",
